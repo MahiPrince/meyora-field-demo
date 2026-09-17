@@ -40,22 +40,55 @@ def _json(row):
 
 
 def _run_chat_selftest() -> None:
+    action_id = None
+    confirmed = None
     try:
-        session_id = "startup-selftest-v1"
+        session_id = "startup-selftest-v2"
         first = run_chat(DB, session_id, "Hey, what do we have for today?")
         second = run_chat(DB, session_id, "Yeah, prepare me for the first one.")
+        third = run_chat(DB, session_id, "Reply to the customer saying I'm on my way and I'll start with diagnostics when I arrive.")
+        pending = third.get("pending_actions") or []
+        if not pending:
+            raise RuntimeError("Natural-language action did not create a pending action")
+        action = pending[0]
+        action_id = action["id"]
+        if action.get("action_type") != "send_email":
+            raise RuntimeError(f"Expected send_email pending action, got {action.get('action_type')}")
+
+        confirmed = confirm_action(DB, action_id, session_id)
+        if not confirmed.get("ok"):
+            raise RuntimeError(f"Pending action confirmation failed: {confirmed}")
+        result = confirmed.get("result") or {}
+        record = result.get("record") or {}
+        email_id = record.get("email_id")
+        if not email_id:
+            raise RuntimeError("Confirmed email action did not return a read-back email_id")
+
         summary = {
-            "first_display_text": (first.get("display_text") or "")[:1200],
-            "first_trace": first.get("route_trace") or first.get("tool_trace") or [],
-            "first_active_context": first.get("active_context") or {},
-            "second_display_text": (second.get("display_text") or "")[:1600],
-            "second_trace": second.get("route_trace") or second.get("tool_trace") or [],
-            "second_active_context": second.get("active_context") or {},
+            "first_trace": first.get("tool_trace") or [],
+            "second_trace": second.get("tool_trace") or [],
+            "action_trace": third.get("tool_trace") or [],
+            "pending_preview": action.get("preview") or {},
+            "confirmed": {"ok": confirmed.get("ok"), "action_type": confirmed.get("action_type"), "result_message": result.get("message"), "email_id": email_id},
             "session_id": session_id,
         }
         print("MEYORA_CHAT_SELFTEST_OK " + json.dumps(summary, default=str), flush=True)
     except Exception as e:
         print("MEYORA_CHAT_SELFTEST_ERROR " + f"{type(e).__name__}: {e}", flush=True)
+    finally:
+        if action_id:
+            try:
+                with _conn() as conn:
+                    if confirmed and confirmed.get("result", {}).get("kind") == "email":
+                        record = confirmed["result"].get("record") or {}
+                        if record.get("email_id"):
+                            conn.execute("DELETE FROM emails WHERE id=%s", (record["email_id"],))
+                    conn.execute("DELETE FROM audit_log WHERE metadata->>'pending_action_id'=%s", (action_id,))
+                    conn.execute("DELETE FROM pending_actions WHERE id=%s", (action_id,))
+                    conn.commit()
+                print("MEYORA_CHAT_SELFTEST_CLEANUP_OK " + action_id, flush=True)
+            except Exception as cleanup_error:
+                print("MEYORA_CHAT_SELFTEST_CLEANUP_ERROR " + f"{type(cleanup_error).__name__}: {cleanup_error}", flush=True)
 
 
 @app.on_event("startup")
