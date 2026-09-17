@@ -46,6 +46,22 @@ def startup():
             connectors_row = conn.execute("SELECT value FROM demo_meta WHERE key='connectors'").fetchone()
             connectors = connectors_row[0] if connectors_row else {}
             print("MEYORA_CONNECTORS " + json.dumps(connectors, sort_keys=True, default=str), flush=True)
+
+        if os.getenv("MEYORA_CHAT_SELFTEST") == "1":
+            try:
+                session_id = "startup-selftest-v1"
+                first = run_chat(DB, session_id, "Hey, what do we have for today?")
+                second = run_chat(DB, session_id, "Yeah, prepare me for the first one.")
+                summary = {
+                    "first_display_text": (first.get("display_text") or "")[:1200],
+                    "first_trace": first.get("route_trace") or first.get("tool_trace") or [],
+                    "second_display_text": (second.get("display_text") or "")[:1600],
+                    "second_trace": second.get("route_trace") or second.get("tool_trace") or [],
+                    "session_id": session_id,
+                }
+                print("MEYORA_CHAT_SELFTEST_OK " + json.dumps(summary, default=str), flush=True)
+            except Exception as e:
+                print("MEYORA_CHAT_SELFTEST_ERROR " + f"{type(e).__name__}: {e}", flush=True)
     except Exception as e:
         STARTUP_ERROR = f"{type(e).__name__}: {e}"
         print("MEYORA_STARTUP_ERROR " + STARTUP_ERROR, flush=True)
