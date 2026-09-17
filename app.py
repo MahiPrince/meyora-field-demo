@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import os
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
@@ -25,12 +26,19 @@ def startup():
     global STARTUP_ERROR
     if not DB:
         STARTUP_ERROR = 'DATABASE_URL is not configured'
+        print('MEYORA_STARTUP_ERROR', STARTUP_ERROR, flush=True)
         return
     try:
-        ensure_seeded(DB)
+        seed_status = ensure_seeded(DB)
         STARTUP_ERROR = None
+        print('MEYORA_SEED_READY ' + json.dumps(seed_status, sort_keys=True, default=str), flush=True)
+        with _conn() as conn:
+            connectors_row = conn.execute("SELECT value FROM demo_meta WHERE key='connectors'").fetchone()
+            connectors = connectors_row[0] if connectors_row else {}
+            print('MEYORA_CONNECTORS ' + json.dumps(connectors, sort_keys=True, default=str), flush=True)
     except Exception as e:
         STARTUP_ERROR = f'{type(e).__name__}: {e}'
+        print('MEYORA_STARTUP_ERROR ' + STARTUP_ERROR, flush=True)
 
 
 @app.get('/health')
