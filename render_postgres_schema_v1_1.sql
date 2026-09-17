@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS products (id text PRIMARY KEY, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS skills (id text PRIMARY KEY, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS territories (id text PRIMARY KEY, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS employees (id text PRIMARY KEY, data jsonb NOT NULL);
-CREATE TABLE IF NOT EXISTS account_assignments (account_id text PRIMARY KEY, data jsonb NOT NULL);
+CREATE TABLE IF NOT EXISTS account_assignments (id text PRIMARY KEY, data jsonb NOT NULL);
 
 CREATE TABLE IF NOT EXISTS accounts (id text PRIMARY KEY, data jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS contacts (id text PRIMARY KEY, account_id text, data jsonb NOT NULL);
@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS crm_tasks (
 CREATE TABLE IF NOT EXISTS sites (id text PRIMARY KEY, account_id text, data jsonb NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_sites_account ON sites(account_id);
 CREATE TABLE IF NOT EXISTS contact_site_links (
-  contact_id text PRIMARY KEY,
+  id text PRIMARY KEY,
   site_id text,
   account_id text,
   data jsonb NOT NULL
@@ -344,7 +344,6 @@ CREATE TABLE IF NOT EXISTS audit_log (
   metadata jsonb
 );
 
--- Helpful V1 views for the conversational layer.
 CREATE OR REPLACE VIEW v_maya_work_orders AS
 SELECT * FROM work_orders WHERE assigned_engineer_id = 'emp_maya_iyer';
 
