@@ -14,12 +14,31 @@ def load_seed_data():
     key = os.environ.get('MEYORA_SEED_KEY')
     if not key:
         raise RuntimeError('MEYORA_SEED_KEY is not configured')
-    b64 = ''.join(p.read_text(encoding='ascii') for p in sorted(SEED_PARTS.glob('seed.b64.part*.txt')))
+    single = SEED_PARTS / 'seed.encrypted.b64'
+    if single.exists():
+        b64 = single.read_text(encoding='ascii').strip()
+    else:
+        b64 = ''.join(p.read_text(encoding='ascii') for p in sorted(SEED_PARTS.glob('seed.b64.part*.txt')))
     if not b64:
-        raise RuntimeError('Encrypted seed parts are missing')
+        raise RuntimeError('Encrypted seed payload is missing')
     token = base64.b64decode(b64)
     packed = Fernet(key.encode('ascii')).decrypt(token)
-    return json.loads(gzip.decompress(packed).decode('utf-8'))
+    data = json.loads(gzip.decompress(packed).decode('utf-8'))
+
+    # Demo branding override: the authored service dataset was initially generated
+    # with Dynamics 365 labels, but the Field Service demo should surface C4C.
+    def rebrand(value):
+        if isinstance(value, dict):
+            return {k: rebrand(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [rebrand(v) for v in value]
+        if value in ('Dynamics 365 Field Service', 'Microsoft Dynamics 365 Field Service'):
+            return 'C4C'
+        if value == 'conn_dynamics_fs':
+            return 'conn_c4c'
+        return value
+
+    return rebrand(data)
 
 
 def upsert(conn, table, records, id_key, extra_map=None):
