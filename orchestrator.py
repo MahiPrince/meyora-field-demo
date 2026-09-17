@@ -163,17 +163,28 @@ def _get_work_order_context(database_url: str, work_order_id: str) -> dict[str, 
                 WHERE asset_id=%s AND id<>%s
                 ORDER BY scheduled_start DESC NULLS LAST LIMIT 12
             """, (asset_id, work_order_id)).fetchall()]
+            emails = [r[0] for r in conn.execute("""
+                SELECT data FROM emails
+                WHERE work_order_id=%s OR asset_id=%s
+                ORDER BY COALESCE(received_at,sent_at) DESC NULLS LAST LIMIT 20
+            """, (work_order_id, asset_id)).fetchall()]
+            teams = [r[0] for r in conn.execute("""
+                SELECT data FROM teams_messages
+                WHERE work_order_id=%s OR asset_id=%s
+                ORDER BY sent_at DESC NULLS LAST LIMIT 20
+            """, (work_order_id, asset_id)).fetchall()]
+        else:
+            emails = [r[0] for r in conn.execute("""
+                SELECT data FROM emails
+                WHERE work_order_id=%s
+                ORDER BY COALESCE(received_at,sent_at) DESC NULLS LAST LIMIT 20
+            """, (work_order_id,)).fetchall()]
+            teams = [r[0] for r in conn.execute("""
+                SELECT data FROM teams_messages
+                WHERE work_order_id=%s
+                ORDER BY sent_at DESC NULLS LAST LIMIT 20
+            """, (work_order_id,)).fetchall()]
 
-        emails = [r[0] for r in conn.execute("""
-            SELECT data FROM emails
-            WHERE work_order_id=%s OR (%s IS NOT NULL AND asset_id=%s)
-            ORDER BY COALESCE(received_at,sent_at) DESC NULLS LAST LIMIT 20
-        """, (work_order_id, asset_id, asset_id)).fetchall()]
-        teams = [r[0] for r in conn.execute("""
-            SELECT data FROM teams_messages
-            WHERE work_order_id=%s OR (%s IS NOT NULL AND asset_id=%s)
-            ORDER BY sent_at DESC NULLS LAST LIMIT 20
-        """, (work_order_id, asset_id, asset_id)).fetchall()]
         parts = [r[0] for r in conn.execute(
             "SELECT data FROM part_reservations WHERE work_order_id=%s", (work_order_id,)
         ).fetchall()]
@@ -318,7 +329,7 @@ def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
     session = get_session(session_id)
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, timeout=30.0, max_retries=1)
     instructions = _instructions(session)
 
     request_args: dict[str, Any] = {
