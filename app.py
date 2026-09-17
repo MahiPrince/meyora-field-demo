@@ -9,11 +9,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import psycopg
 
+from actions import cancel_action, confirm_action, ensure_action_schema
 from orchestrator import chat as run_chat
 from seed_loader import ensure_seeded
 
 
-app = FastAPI(title="Meyora Field Demo API", version="0.3.0")
+app = FastAPI(title="Meyora Field Demo API", version="0.4.0")
 DB = os.getenv("DATABASE_URL")
 STARTUP_ERROR = None
 WEB_INDEX = os.path.join(os.path.dirname(__file__), "web", "index.html")
@@ -22,6 +23,10 @@ WEB_INDEX = os.path.join(os.path.dirname(__file__), "web", "index.html")
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     session_id: str = Field(default="maya-demo", min_length=1, max_length=120)
+
+
+class ActionDecision(BaseModel):
+    session_id: str = Field(min_length=1, max_length=120)
 
 
 def _conn():
@@ -62,8 +67,10 @@ def startup():
         return
     try:
         seed_status = ensure_seeded(DB)
+        ensure_action_schema(DB)
         STARTUP_ERROR = None
         print("MEYORA_SEED_READY " + json.dumps(seed_status, sort_keys=True, default=str), flush=True)
+        print("MEYORA_ACTIONS_READY", flush=True)
         with _conn() as conn:
             connectors_row = conn.execute("SELECT value FROM demo_meta WHERE key='connectors'").fetchone()
             connectors = connectors_row[0] if connectors_row else {}
@@ -80,9 +87,10 @@ def startup():
 def root():
     return {
         "name": "Meyora Field Demo API",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "demo": "/demo",
         "chat": "/chat",
+        "actions": "/actions/{action_id}/confirm",
         "docs": "/docs",
         "field_service_system": "C4C",
     }
@@ -102,10 +110,12 @@ def health():
     try:
         with _conn() as conn:
             seed = conn.execute("SELECT value FROM demo_meta WHERE key='seed_status'").fetchone()
+            actions_ready = conn.execute("SELECT to_regclass('public.pending_actions')").fetchone()[0]
             return {
                 "ok": bool(seed and seed[0].get("ok")),
                 "database": "connected",
                 "seed_status": _json(seed),
+                "actions_ready": bool(actions_ready),
                 "startup_error": STARTUP_ERROR,
                 "openai_configured": bool(os.getenv("OPENAI_API_KEY")),
                 "openai_model": os.getenv("OPENAI_MODEL", "gpt-5.6-luna"),
@@ -218,4 +228,38 @@ def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:
         print("MEYORA_CHAT_ERROR " + f"{type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.post("/actions/{action_id}/confirm")
+def confirm_pending_action(action_id: str, decision: ActionDecision):
+    if not DB:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
+    try:
+        result = confirm_action(DB, action_id, decision.session_id)
+        if not result.get("ok"):
+            code = 404 if result.get("error") == "action_not_found" else 409
+            raise HTTPException(code, result.get("error") or "Action could not be confirmed")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("MEYORA_ACTION_CONFIRM_ERROR " + f"{type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.post("/actions/{action_id}/cancel")
+def cancel_pending_action(action_id: str, decision: ActionDecision):
+    if not DB:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
+    try:
+        result = cancel_action(DB, action_id, decision.session_id)
+        if not result.get("ok"):
+            code = 404 if result.get("error") == "action_not_found" else 409
+            raise HTTPException(code, result.get("error") or "Action could not be canceled")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("MEYORA_ACTION_CANCEL_ERROR " + f"{type(e).__name__}: {e}", flush=True)
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
