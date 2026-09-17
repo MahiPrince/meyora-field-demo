@@ -45,6 +45,15 @@ def health():
         return {'ok': False, 'database': 'error', 'error': f'{type(e).__name__}: {e}', 'startup_error': STARTUP_ERROR}
 
 
+@app.get('/connectors')
+def connectors():
+    with _conn() as conn:
+        row = conn.execute("SELECT value FROM demo_meta WHERE key='connectors'").fetchone()
+        if not row:
+            raise HTTPException(404, 'Connector metadata not found')
+        return row[0]
+
+
 @app.get('/me')
 def me():
     with _conn() as conn:
