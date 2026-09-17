@@ -8,6 +8,8 @@ from typing import Any
 import psycopg
 from openai import OpenAI
 
+from actions import propose_email_reply, propose_meeting, propose_teams_reply
+
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
@@ -59,6 +61,54 @@ TOOLS = [
             "type": "object",
             "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}},
             "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_email_reply",
+        "description": "Create a governed Outlook reply draft for user confirmation. Use this when Maya asks to reply/email a customer. It does NOT send the email.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "body_text": {"type": "string"},
+                "thread_id": {"type": ["string", "null"]},
+                "work_order_id": {"type": ["string", "null"]}
+            },
+            "required": ["body_text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_teams_reply",
+        "description": "Create a governed Microsoft Teams message draft for user confirmation. It does NOT send the message.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "body_text": {"type": "string"},
+                "conversation_id": {"type": ["string", "null"]},
+                "work_order_id": {"type": ["string", "null"]}
+            },
+            "required": ["body_text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_meeting",
+        "description": "Create a governed Outlook Calendar + Teams meeting preview for user confirmation. It does NOT create the meeting until confirmed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start_at": {"type": "string", "description": "Demo-local ISO datetime, e.g. 2026-09-15T16:30:00"},
+                "end_at": {"type": "string", "description": "Demo-local ISO datetime"},
+                "attendee_names": {"type": "array", "items": {"type": "string"}},
+                "work_order_id": {"type": ["string", "null"]},
+                "account_id": {"type": ["string", "null"]}
+            },
+            "required": ["title", "start_at", "end_at", "attendee_names"],
             "additionalProperties": False,
         },
     },
@@ -217,7 +267,7 @@ def _search_json_table(database_url: str, table: str, query: str, order_sql: str
         ).fetchall()]
 
 
-def execute_tool(database_url: str, name: str, arguments: dict[str, Any]) -> Any:
+def execute_tool(database_url: str, session_id: str, session: dict[str, Any], name: str, arguments: dict[str, Any]) -> Any:
     if name == "get_my_day":
         return _get_my_day(database_url)
     if name == "get_work_order_context":
@@ -228,6 +278,33 @@ def execute_tool(database_url: str, name: str, arguments: dict[str, Any]) -> Any
         return _search_json_table(database_url, "emails", arguments["query"], "ORDER BY COALESCE(received_at,sent_at) DESC NULLS LAST", arguments.get("limit", 10))
     if name == "search_teams_messages":
         return _search_json_table(database_url, "teams_messages", arguments["query"], "ORDER BY sent_at DESC NULLS LAST", arguments.get("limit", 10))
+    if name == "propose_email_reply":
+        return propose_email_reply(
+            database_url,
+            session_id,
+            arguments["body_text"],
+            arguments.get("thread_id"),
+            arguments.get("work_order_id") or session.get("active_work_order_id"),
+        )
+    if name == "propose_teams_reply":
+        return propose_teams_reply(
+            database_url,
+            session_id,
+            arguments["body_text"],
+            arguments.get("conversation_id"),
+            arguments.get("work_order_id") or session.get("active_work_order_id"),
+        )
+    if name == "propose_meeting":
+        return propose_meeting(
+            database_url,
+            session_id,
+            arguments["title"],
+            arguments["start_at"],
+            arguments["end_at"],
+            arguments["attendee_names"],
+            arguments.get("work_order_id") or session.get("active_work_order_id"),
+            arguments.get("account_id") or session.get("active_account_id"),
+        )
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -287,7 +364,13 @@ Rules:
 - For prepare me or brief me, call get_work_order_context and synthesize customer/site, issue, asset, relevant history, recent customer communication, team context, parts, and commercial context when relevant.
 - Distinguish facts retrieved from demo records from your own inference. Do not invent missing service events.
 - Keep answers concise enough for a mobile chat, but include the details needed to act.
-- Do not perform writes yet. If Maya asks to send/update/create something, say the action can be drafted but write-confirmation tools are not enabled in this build.
+
+Governed actions:
+- You can prepare writes, but NEVER send/create them directly in chat. Every write must become a pending action that the user confirms in the UI.
+- If Maya asks to reply/email a customer, call propose_email_reply. Use the active work order when the user says things like 'them' or 'the customer'.
+- If Maya asks to message someone on Teams, identify the relevant conversation (search Teams first when a named person is specified), then call propose_teams_reply.
+- If Maya asks to schedule/create a meeting, call propose_meeting. Use demo-local ISO times (the authored demo date is 2026-09-15 unless the conversation establishes another demo date).
+- After a propose tool succeeds, tell Maya the draft/meeting is ready for confirmation. Do not say sent, posted, scheduled, or created until a confirmed action result is returned by the application.
 """.strip()
 
 
@@ -323,6 +406,15 @@ def _ui_blocks_from_trace(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return blocks
 
 
+def _pending_actions_from_trace(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    actions = []
+    for item in trace:
+        result = item.get("result")
+        if isinstance(result, dict) and result.get("pending_action"):
+            actions.append(result["pending_action"])
+    return actions
+
+
 def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -330,11 +422,10 @@ def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
 
     session = get_session(session_id)
     client = OpenAI(api_key=api_key, timeout=30.0, max_retries=1)
-    instructions = _instructions(session)
 
     request_args: dict[str, Any] = {
         "model": MODEL,
-        "instructions": instructions,
+        "instructions": _instructions(session),
         "input": message,
         "tools": TOOLS,
     }
@@ -344,7 +435,7 @@ def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
     response = client.responses.create(**request_args)
     trace: list[dict[str, Any]] = []
 
-    for _ in range(6):
+    for _ in range(8):
         calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
         if not calls:
             break
@@ -352,7 +443,7 @@ def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
         tool_outputs = []
         for call in calls:
             args = json.loads(call.arguments or "{}")
-            result = execute_tool(database_url, call.name, args)
+            result = execute_tool(database_url, session_id, session, call.name, args)
             _remember_tool_result(session, call.name, result)
             trace.append({"tool": call.name, "arguments": args, "result": result})
             tool_outputs.append({
@@ -389,7 +480,7 @@ def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
         "speech_text": _speechify(text),
         "conversation_text": text,
         "ui_blocks": _ui_blocks_from_trace(trace),
-        "pending_actions": [],
+        "pending_actions": _pending_actions_from_trace(trace),
         "active_context": active_context,
         "tool_trace": [{"tool": t["tool"], "arguments": t["arguments"]} for t in trace],
         "model": MODEL,
