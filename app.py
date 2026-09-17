@@ -5,6 +5,7 @@ import os
 import threading
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import psycopg
 
@@ -12,9 +13,10 @@ from orchestrator import chat as run_chat
 from seed_loader import ensure_seeded
 
 
-app = FastAPI(title="Meyora Field Demo API", version="0.2.0")
+app = FastAPI(title="Meyora Field Demo API", version="0.3.0")
 DB = os.getenv("DATABASE_URL")
 STARTUP_ERROR = None
+WEB_INDEX = os.path.join(os.path.dirname(__file__), "web", "index.html")
 
 
 class ChatRequest(BaseModel):
@@ -78,11 +80,19 @@ def startup():
 def root():
     return {
         "name": "Meyora Field Demo API",
-        "version": "0.2.0",
+        "version": "0.3.0",
+        "demo": "/demo",
         "chat": "/chat",
         "docs": "/docs",
         "field_service_system": "C4C",
     }
+
+
+@app.get("/demo", include_in_schema=False)
+def demo():
+    if not os.path.exists(WEB_INDEX):
+        raise HTTPException(404, "Demo client not found")
+    return FileResponse(WEB_INDEX, media_type="text/html")
 
 
 @app.get("/health")
