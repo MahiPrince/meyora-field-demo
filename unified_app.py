@@ -342,7 +342,10 @@ def chat_start(
         raise HTTPException(503, "Field Service database is not configured")
     local_id = uuid.uuid4().hex
     job_id = f"field:{local_id}"
-    session_id = f"ios-{principal.principal_id}-{local_id[:12]}"
+    # Preserve conversational references across separate V4.2 chat jobs.
+    # The proven iOS client sends a new job per turn, while the Field Service
+    # orchestrator keeps its context by session id.
+    session_id = f"ios-{principal.principal_id}"
     with _JOBS_LOCK:
         _JOBS[job_id] = {
             "state": "queued",
