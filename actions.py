@@ -111,7 +111,7 @@ def propose_teams_reply(database_url: str, session_id: str, body_text: str, conv
         title = convo[0] or "Teams conversation"
         recipient = "Teams conversation"
         if latest and latest[0]:
-            who = conn.execute("SELECT display_name FROM identity_directory WHERE person_id=%s", (latest[0],)).fetchone()
+            who = conn.execute("SELECT display_name FROM identity_directory WHERE id=%s", (latest[0],)).fetchone()
             if who and who[0]:
                 recipient = who[0]
         payload = {"conversation_id": conversation_id, "work_order_id": work_order_id, "body_text": body_text, "title": title}
@@ -131,7 +131,7 @@ def propose_meeting(database_url: str, session_id: str, title: str, start_at: st
         resolved = []
         for name in attendee_names or []:
             row = conn.execute(
-                "SELECT person_id,display_name,email FROM identity_directory WHERE display_name ILIKE %s ORDER BY CASE WHEN lower(display_name)=lower(%s) THEN 0 ELSE 1 END LIMIT 1",
+                "SELECT id,display_name,email FROM identity_directory WHERE display_name ILIKE %s ORDER BY CASE WHEN lower(display_name)=lower(%s) THEN 0 ELSE 1 END LIMIT 1",
                 (f"%{name}%", name),
             ).fetchone()
             if row:
