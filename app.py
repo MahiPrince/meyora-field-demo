@@ -518,6 +518,41 @@ def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
 
+
+@app.post("/adapter/actions/{action_id}/confirm")
+def adapter_confirm_action(action_id: str, decision: ActionDecision, authorization: str | None = Header(default=None)):
+    _require_adapter_token(authorization)
+    if not DB:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
+    try:
+        result = confirm_action(DB, action_id, decision.session_id)
+        if not result.get("ok"):
+            code = 404 if result.get("error") == "action_not_found" else 409
+            raise HTTPException(code, result.get("error") or "Action could not be confirmed")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.post("/adapter/actions/{action_id}/cancel")
+def adapter_cancel_action(action_id: str, decision: ActionDecision, authorization: str | None = Header(default=None)):
+    _require_adapter_token(authorization)
+    if not DB:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
+    try:
+        result = cancel_action(DB, action_id, decision.session_id)
+        if not result.get("ok"):
+            code = 404 if result.get("error") == "action_not_found" else 409
+            raise HTTPException(code, result.get("error") or "Action could not be canceled")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
 @app.post("/actions/{action_id}/confirm")
 def confirm_pending_action(action_id: str, decision: ActionDecision):
     if not DB:
