@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import os
 import threading
+import secrets
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import psycopg
 
 from actions import cancel_action, confirm_action, ensure_action_schema
-from orchestrator import chat as run_chat
+from orchestrator import chat as run_chat, execute_tool, get_session
 from seed_loader import ensure_seeded
 
 
@@ -27,6 +28,189 @@ class ChatRequest(BaseModel):
 
 class ActionDecision(BaseModel):
     session_id: str = Field(min_length=1, max_length=120)
+
+
+class AdapterToolRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    arguments: dict = Field(default_factory=dict)
+    session_id: str = Field(default="meyora-core", min_length=1, max_length=160)
+
+
+
+def _require_adapter_token(authorization: str | None) -> None:
+    expected = (os.getenv("MEYORA_ADAPTER_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="MEYORA_ADAPTER_TOKEN is not configured")
+    supplied = ""
+    if authorization and authorization.startswith("Bearer "):
+        supplied = authorization.split(" ", 1)[1].strip()
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="invalid_adapter_token")
+
+
+def _date_range_clause(column: str, args: dict, params: list):
+    clauses = []
+    date_from = args.get("date_from")
+    date_to = args.get("date_to")
+    date_value = args.get("date")
+    if date_value:
+        clauses.append(f"{column}::date=%s::date")
+        params.append(date_value)
+    else:
+        if date_from:
+            clauses.append(f"{column}::date >= %s::date")
+            params.append(date_from)
+        if date_to:
+            clauses.append(f"{column}::date <= %s::date")
+            params.append(date_to)
+    return clauses
+
+
+def _adapter_execute(name: str, args: dict, session_id: str):
+    args = args or {}
+    limit = max(1, min(int(args.get("limit") or 20), 100))
+
+    if name == "work.search":
+        params = []
+        where = []
+        query = str(args.get("query") or "").strip()
+        if query:
+            where.append("(wo.data::text ILIKE %s OR a.data::text ILIKE %s OR ast.data::text ILIKE %s)")
+            pattern = f"%{query}%"
+            params.extend([pattern, pattern, pattern])
+        where += _date_range_clause("wo.scheduled_start", args, params)
+        if args.get("status"):
+            where.append("lower(COALESCE(wo.status,''))=lower(%s)")
+            params.append(str(args["status"]))
+        dataset_user = None
+        with _conn() as conn:
+            meta = conn.execute("SELECT value FROM demo_meta WHERE key='dataset'").fetchone()
+            if meta:
+                dataset_user = (meta[0] or {}).get("logged_in_user_id")
+            if dataset_user:
+                where.append("wo.assigned_engineer_id=%s")
+                params.append(dataset_user)
+            sql = """
+                SELECT wo.data, a.data, s.data, ast.data
+                FROM work_orders wo
+                LEFT JOIN accounts a ON a.id=wo.account_id
+                LEFT JOIN sites s ON s.id=wo.site_id
+                LEFT JOIN assets ast ON ast.id=wo.asset_id
+            """
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY wo.scheduled_start ASC NULLS LAST LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+        items = [{"work_order": r[0], "account": r[1], "site": r[2], "asset": r[3]} for r in rows]
+        return {"ok": True, "count": len(items), "items": items}
+
+    if name == "work.context":
+        result = execute_tool(DB, session_id, get_session(session_id), "get_work_order_context", {
+            "work_order_id": args.get("work_order_id")
+        })
+        return {"ok": not bool(isinstance(result, dict) and result.get("error")), "context": result}
+
+    if name == "calendar.search":
+        params = []
+        where = []
+        where += _date_range_clause("start_at", args, params)
+        query = str(args.get("query") or "").strip()
+        if query:
+            where.append("data::text ILIKE %s")
+            params.append(f"%{query}%")
+        with _conn() as conn:
+            sql = "SELECT data FROM calendar_events"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY start_at ASC NULLS LAST LIMIT %s"
+            params.append(limit)
+            items = [r[0] for r in conn.execute(sql, params).fetchall()]
+        return {"ok": True, "count": len(items), "items": items}
+
+    if name == "mail.search":
+        params = []
+        where = ["status <> 'draft'"]
+        query = str(args.get("query") or "").strip()
+        if query:
+            where.append("data::text ILIKE %s")
+            params.append(f"%{query}%")
+        where += _date_range_clause("COALESCE(received_at,sent_at)", args, params)
+        if args.get("unread_only"):
+            where.append("is_read=false")
+        with _conn() as conn:
+            sql = "SELECT data FROM emails WHERE " + " AND ".join(where)
+            sql += " ORDER BY COALESCE(received_at,sent_at) DESC NULLS LAST LIMIT %s"
+            params.append(limit)
+            items = [r[0] for r in conn.execute(sql, params).fetchall()]
+        return {"ok": True, "count": len(items), "items": items}
+
+    if name == "teams.search":
+        params = []
+        where = []
+        query = str(args.get("query") or "").strip()
+        if query:
+            pattern = f"%{query}%"
+            where.append("(tm.data::text ILIKE %s OR COALESCE(d.display_name,'') ILIKE %s OR COALESCE(tc.title,'') ILIKE %s)")
+            params.extend([pattern, pattern, pattern])
+        where += _date_range_clause("tm.sent_at", args, params)
+        with _conn() as conn:
+            sql = """
+                SELECT tm.data, d.display_name, tc.title
+                FROM teams_messages tm
+                LEFT JOIN identity_directory d ON d.id=tm.sender_person_id
+                LEFT JOIN teams_conversations tc ON tc.id=tm.conversation_id
+            """
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY tm.sent_at DESC NULLS LAST LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+        items = []
+        for data, sender, title in rows:
+            item = dict(data or {})
+            if sender:
+                item["sender_name"] = sender
+            if title:
+                item["conversation_title"] = title
+            items.append(item)
+        return {"ok": True, "count": len(items), "items": items}
+
+    if name == "inventory.search":
+        query = str(args.get("query") or "").strip()
+        params = []
+        where = []
+        if query:
+            where.append("(p.data::text ILIKE %s OR p.id ILIKE %s)")
+            pattern = f"%{query}%"
+            params.extend([pattern, pattern])
+        with _conn() as conn:
+            sql = """
+                SELECT p.data,
+                       COALESCE(SUM(s.quantity_on_hand),0) AS on_hand,
+                       COALESCE(SUM(s.quantity_reserved),0) AS reserved
+                FROM parts p
+                LEFT JOIN inventory_stock s ON s.part_id=p.id
+            """
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " GROUP BY p.id,p.data ORDER BY p.id LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+        items = [{"part": r[0], "quantity_on_hand": r[1], "quantity_reserved": r[2]} for r in rows]
+        return {"ok": True, "count": len(items), "items": items}
+
+    legacy_map = {
+        "mail.reply.propose": "propose_email_reply",
+        "teams.message.propose": "propose_teams_reply",
+        "meeting.propose": "propose_meeting",
+    }
+    if name in legacy_map:
+        result = execute_tool(DB, session_id, get_session(session_id), legacy_map[name], args)
+        ok = not bool(isinstance(result, dict) and result.get("error"))
+        return {"ok": ok, **(result if isinstance(result, dict) else {"result": result})}
+
+    raise HTTPException(status_code=400, detail=f"unsupported_adapter_tool: {name}")
 
 
 def _conn():
@@ -247,6 +431,76 @@ def work_order_context(work_order_id: str):
             "SELECT data FROM opportunities WHERE account_id=%s", (acct,)
         ).fetchall()] if acct else []
         return {"work_order": d, "asset": _json(asset), "history": history, "emails": emails, "teams": teams, "parts": parts, "opportunities": opps}
+
+
+
+@app.get("/adapter/capabilities")
+def adapter_capabilities(authorization: str | None = Header(default=None)):
+    _require_adapter_token(authorization)
+    return {
+        "adapter": "field_service_render",
+        "domain": "field_service",
+        "connector_modes": {
+            "c4c": "mock",
+            "outlook": "mock",
+            "teams": "mock",
+            "calendar": "mock",
+            "inventory": "mock",
+        },
+        "tools": [
+            "work.search",
+            "work.context",
+            "calendar.search",
+            "mail.search",
+            "teams.search",
+            "inventory.search",
+            "mail.reply.propose",
+            "teams.message.propose",
+            "meeting.propose",
+        ],
+    }
+
+
+@app.post("/adapter/tool")
+def adapter_tool(request: AdapterToolRequest, authorization: str | None = Header(default=None)):
+    _require_adapter_token(authorization)
+    if not DB:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
+    try:
+        return _adapter_execute(request.name, request.arguments, request.session_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("MEYORA_ADAPTER_TOOL_ERROR " + f"{request.name}: {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
+
+
+@app.get("/adapter/coverage")
+def adapter_coverage(authorization: str | None = Header(default=None)):
+    _require_adapter_token(authorization)
+    with _conn() as conn:
+        def span(table: str, column: str):
+            row = conn.execute(
+                f"SELECT min({column})::text, max({column})::text, count(*) FROM {table}"
+            ).fetchone()
+            return {"min": row[0], "max": row[1], "count": row[2]}
+
+        daily = [
+            {"date": r[0].isoformat(), "work_orders": r[1]}
+            for r in conn.execute("""
+                SELECT scheduled_start::date, count(*)
+                FROM work_orders
+                WHERE scheduled_start IS NOT NULL
+                GROUP BY 1 ORDER BY 1
+            """).fetchall()
+        ]
+        return {
+            "work_orders": span("work_orders", "scheduled_start"),
+            "calendar_events": span("calendar_events", "start_at"),
+            "emails": span("emails", "COALESCE(received_at,sent_at)"),
+            "teams_messages": span("teams_messages", "sent_at"),
+            "daily_work_orders": daily,
+        }
 
 
 @app.post("/chat")
