@@ -17,8 +17,29 @@ TOOLS = [
     {
         "type": "function",
         "name": "get_my_day",
-        "description": "Get Maya Iyer's authored demo day from C4C, Outlook, Teams, and Outlook Calendar. Use this for today, morning briefing, reminders, unread mail/messages, and schedule questions.",
+        "description": "Get Maya Iyer's broad authored TODAY briefing from C4C, Outlook, Teams, and Outlook Calendar. Use only for a daily/today briefing that intentionally combines work orders, reminders, mail, and Teams. Do NOT use for Teams-only, email-only, or tomorrow/named-date questions.",
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "get_schedule_for_date",
+        "description": "Get Maya's C4C work orders/service appointments and Outlook Calendar events for one exact authored-demo date. Use for tomorrow, yesterday, or a named date. The authored demo operational date is 2026-09-15, so tomorrow is 2026-09-16.",
+        "parameters": {
+            "type": "object",
+            "properties": {"date": {"type": "string", "description": "YYYY-MM-DD"}},
+            "required": ["date"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_recent_teams_messages",
+        "description": "Get the most recent Microsoft Teams messages up to the authored demo as-of time. Use for latest/recent Teams-message questions instead of get_my_day.",
+        "parameters": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20}},
+            "additionalProperties": False,
+        },
     },
     {
         "type": "function",
@@ -189,6 +210,94 @@ def _get_my_day(database_url: str) -> dict[str, Any]:
         }
 
 
+
+def _get_schedule_for_date(database_url: str, day: str) -> dict[str, Any]:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+        return {"error": "invalid_date", "date": day, "expected": "YYYY-MM-DD"}
+
+    with _conn(database_url) as conn:
+        dataset = _meta(conn, "dataset")
+        maya = dataset["logged_in_user_id"]
+
+        work_orders = []
+        rows = conn.execute("""
+            SELECT wo.data, a.data, s.data, ast.data
+            FROM work_orders wo
+            LEFT JOIN accounts a ON a.id=wo.account_id
+            LEFT JOIN sites s ON s.id=wo.site_id
+            LEFT JOIN assets ast ON ast.id=wo.asset_id
+            WHERE wo.assigned_engineer_id=%s AND wo.scheduled_start::date=%s::date
+            ORDER BY wo.scheduled_start
+        """, (maya, day)).fetchall()
+        for wo, account, site, asset in rows:
+            work_orders.append({"work_order": wo, "account": account, "site": site, "asset": asset})
+
+        calendar = [r[0] for r in conn.execute(
+            "SELECT data FROM calendar_events WHERE start_at::date=%s::date ORDER BY start_at",
+            (day,),
+        ).fetchall()]
+
+        return {
+            "date": day,
+            "source_systems": ["C4C", "Outlook Calendar"],
+            "work_orders": work_orders,
+            "calendar": calendar,
+        }
+
+
+def _get_recent_teams_messages(database_url: str, limit: int = 5) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 5), 20))
+    with _conn(database_url) as conn:
+        ctx = _meta(conn, "demo_context")
+        asof = ctx["demo_as_of"]
+        rows = conn.execute("""
+            SELECT tm.data, d.display_name, tc.title
+            FROM teams_messages tm
+            LEFT JOIN identity_directory d ON d.id=tm.sender_person_id
+            LEFT JOIN teams_conversations tc ON tc.id=tm.conversation_id
+            WHERE tm.sent_at <= %s::timestamp
+            ORDER BY tm.sent_at DESC NULLS LAST
+            LIMIT %s
+        """, (asof, limit)).fetchall()
+
+        result = []
+        for data, sender_name, conversation_title in rows:
+            item = dict(data or {})
+            if sender_name:
+                item["sender_name"] = sender_name
+            if conversation_title:
+                item["conversation_title"] = conversation_title
+            result.append(item)
+        return result
+
+
+def _search_teams_messages(database_url: str, query: str, limit: int = 10) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 10), 20))
+    pattern = f"%{query}%"
+    with _conn(database_url) as conn:
+        rows = conn.execute("""
+            SELECT tm.data, d.display_name, tc.title
+            FROM teams_messages tm
+            LEFT JOIN identity_directory d ON d.id=tm.sender_person_id
+            LEFT JOIN teams_conversations tc ON tc.id=tm.conversation_id
+            WHERE tm.data::text ILIKE %s
+               OR COALESCE(d.display_name, '') ILIKE %s
+               OR COALESCE(tc.title, '') ILIKE %s
+            ORDER BY tm.sent_at DESC NULLS LAST
+            LIMIT %s
+        """, (pattern, pattern, pattern, limit)).fetchall()
+
+        result = []
+        for data, sender_name, conversation_title in rows:
+            item = dict(data or {})
+            if sender_name:
+                item["sender_name"] = sender_name
+            if conversation_title:
+                item["conversation_title"] = conversation_title
+            result.append(item)
+        return result
+
+
 def _get_work_order_context(database_url: str, work_order_id: str) -> dict[str, Any]:
     with _conn(database_url) as conn:
         row = conn.execute("""
@@ -270,6 +379,10 @@ def _search_json_table(database_url: str, table: str, query: str, order_sql: str
 def execute_tool(database_url: str, session_id: str, session: dict[str, Any], name: str, arguments: dict[str, Any]) -> Any:
     if name == "get_my_day":
         return _get_my_day(database_url)
+    if name == "get_schedule_for_date":
+        return _get_schedule_for_date(database_url, arguments["date"])
+    if name == "get_recent_teams_messages":
+        return _get_recent_teams_messages(database_url, arguments.get("limit", 5))
     if name == "get_work_order_context":
         return _get_work_order_context(database_url, arguments["work_order_id"])
     if name == "search_work_orders":
@@ -277,7 +390,7 @@ def execute_tool(database_url: str, session_id: str, session: dict[str, Any], na
     if name == "search_emails":
         return _search_json_table(database_url, "emails", arguments["query"], "ORDER BY COALESCE(received_at,sent_at) DESC NULLS LAST", arguments.get("limit", 10))
     if name == "search_teams_messages":
-        return _search_json_table(database_url, "teams_messages", arguments["query"], "ORDER BY sent_at DESC NULLS LAST", arguments.get("limit", 10))
+        return _search_teams_messages(database_url, arguments["query"], arguments.get("limit", 10))
     if name == "propose_email_reply":
         return propose_email_reply(
             database_url,
@@ -327,6 +440,24 @@ def _remember_tool_result(session: dict[str, Any], tool_name: str, result: Any) 
         session["recent_work_orders"] = recent
         if recent:
             session["active_work_order_id"] = recent[0]["work_order_id"]
+    elif tool_name == "get_schedule_for_date" and isinstance(result, dict):
+        recent = []
+        for item in result.get("work_orders", []):
+            wo = item.get("work_order") or {}
+            acct = item.get("account") or {}
+            site = item.get("site") or {}
+            asset = item.get("asset") or {}
+            recent.append({
+                "work_order_id": wo.get("work_order_id") or wo.get("id"),
+                "scheduled_start": wo.get("scheduled_start"),
+                "account_name": acct.get("name") or acct.get("account_name") or wo.get("account_name"),
+                "site_name": site.get("site_name") or site.get("name"),
+                "asset_name": asset.get("product_name") or asset.get("name") or wo.get("product_name"),
+                "issue": wo.get("subject") or wo.get("issue_summary") or wo.get("description"),
+            })
+        session["recent_work_orders"] = recent
+        if recent:
+            session["active_work_order_id"] = recent[0]["work_order_id"]
     elif tool_name == "get_work_order_context" and isinstance(result, dict):
         wo = result.get("work_order") or {}
         session["active_work_order_id"] = wo.get("work_order_id") or wo.get("id")
@@ -351,14 +482,17 @@ def _instructions(session: dict[str, Any]) -> str:
 The field-service system presented in this demo is C4C. Never call it Dynamics 365, Dynamics, Salesforce Field Service, or ServiceNow.
 Connected demo systems are exactly: C4C, Microsoft Outlook, Microsoft Teams, and Outlook Calendar.
 
-This is a static authored demo snapshot, not a simulator. Relative terms such as today, this morning, and later today refer to the demo date returned by get_my_day, not the wall-clock date.
+This is a static authored demo snapshot, not a simulator. The authored operational date is 2026-09-15. Relative terms such as today, this morning, and later today refer to that demo date, not the phone/device wall-clock date. If the user explicitly asks what day/date it is, say "In this authored demo snapshot..." and never imply that 2026-09-15 is their real-world current date. Tomorrow resolves to 2026-09-16.
 
 Current conversation entity state:
 {json.dumps(state, default=str)}
 
 Rules:
 - For operational questions, use tools instead of guessing.
-- For a daily briefing, call get_my_day and present information in this order: appointments/work orders first, then reminders, then important Outlook email, then important Teams messages. Mention calendar blocks only when useful.
+- For a broad daily/today briefing, call get_my_day and present information in this order: appointments/work orders first, then reminders, then important Outlook email, then important Teams messages. Mention calendar blocks only when useful.
+- For tomorrow, yesterday, or any named-date schedule question, call get_schedule_for_date with the exact YYYY-MM-DD. Never use get_my_day for a non-today date.
+- For latest/recent Teams-message questions, call get_recent_teams_messages. For person/topic-specific Teams questions, call search_teams_messages. Do not call get_my_day just to answer a Teams-only question.
+- For email-only questions, use search_emails rather than get_my_day unless the user explicitly asks for a broad daily briefing.
 - Be conversational, not dashboard-like.
 - When Maya says the first one, that instrument, them, or similar, resolve it from the current conversation state.
 - For prepare me or brief me, call get_work_order_context and synthesize customer/site, issue, asset, relevant history, recent customer communication, team context, parts, and commercial context when relevant.
@@ -380,11 +514,30 @@ def _speechify(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:1800]
 
 
-def _ui_blocks_from_trace(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _wants_schedule_cards(message: str) -> bool:
+    text = (message or "").lower()
+    schedule_phrases = (
+        "appointment", "appointments", "schedule", "work order", "work orders",
+        "service work", "jobs", "my day", "what do we have", "prepare me", "brief me",
+    )
+    return any(term in text for term in schedule_phrases)
+
+
+def _ui_blocks_from_trace(trace: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     for item in trace:
-        if item["tool"] == "get_my_day":
+        if item["tool"] == "get_my_day" and _wants_schedule_cards(message):
             for row in (item.get("result") or {}).get("work_orders", [])[:3]:
+                blocks.append({
+                    "type": "service_appointment",
+                    "source": "C4C",
+                    "work_order": row.get("work_order"),
+                    "account": row.get("account"),
+                    "site": row.get("site"),
+                    "asset": row.get("asset"),
+                })
+        elif item["tool"] == "get_schedule_for_date":
+            for row in (item.get("result") or {}).get("work_orders", [])[:6]:
                 blocks.append({
                     "type": "service_appointment",
                     "source": "C4C",
@@ -479,7 +632,7 @@ def chat(database_url: str, session_id: str, message: str) -> dict[str, Any]:
         "display_text": text,
         "speech_text": _speechify(text),
         "conversation_text": text,
-        "ui_blocks": _ui_blocks_from_trace(trace),
+        "ui_blocks": _ui_blocks_from_trace(trace, message),
         "pending_actions": _pending_actions_from_trace(trace),
         "active_context": active_context,
         "tool_trace": [{"tool": t["tool"], "arguments": t["arguments"]} for t in trace],
