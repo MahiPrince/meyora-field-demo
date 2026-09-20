@@ -1,5 +1,6 @@
 from __future__ import annotations
 import base64, gzip, json, os
+from datetime import timedelta
 from pathlib import Path
 import psycopg
 from psycopg.types.json import Jsonb
@@ -147,11 +148,178 @@ def seed_database(database_url: str):
     return {'ok': True, 'counts': counts, 'maya_demo_day_work_orders': maya_count}
 
 
+
+def ensure_monthly_teams_extension(database_url: str):
+    """Fill the second half of September with deterministic synthetic Teams context.
+
+    The encrypted authored seed already contains a full month of work orders/calendar
+    and email, but its Teams timeline ends mid-month. This extension derives
+    additional mock Teams messages from the existing Maya work orders so date-based
+    questions remain useful across the full month without hard-coded chat answers.
+    It is idempotent and never touches user-created/action-generated messages.
+    """
+    inserted = 0
+    with psycopg.connect(database_url, sslmode='require') as conn:
+        dataset_row = conn.execute(
+            "SELECT value FROM demo_meta WHERE key='dataset'"
+        ).fetchone()
+        maya = (dataset_row[0] or {}).get('logged_in_user_id') if dataset_row else None
+        if not maya:
+            return {'ok': False, 'reason': 'maya_principal_missing', 'inserted': 0}
+
+        sender_rows = conn.execute("""
+            SELECT DISTINCT ON (lower(d.display_name))
+                   d.id, d.display_name, tm.conversation_id, tm.channel_id
+            FROM teams_messages tm
+            JOIN identity_directory d ON d.id=tm.sender_person_id
+            WHERE (
+                lower(d.display_name) LIKE 'nikhil%%'
+                OR lower(d.display_name) LIKE 'hannah%%'
+                OR lower(d.display_name) LIKE 'david%%'
+            )
+            ORDER BY lower(d.display_name), tm.sent_at DESC NULLS LAST
+        """).fetchall()
+
+        senders = [
+            {
+                'person_id': row[0],
+                'display_name': row[1],
+                'conversation_id': row[2],
+                'channel_id': row[3],
+            }
+            for row in sender_rows
+            if row[0] and row[2]
+        ]
+        if not senders:
+            fallback = conn.execute("""
+                SELECT tm.sender_person_id, COALESCE(d.display_name,'Field Support'),
+                       tm.conversation_id, tm.channel_id
+                FROM teams_messages tm
+                LEFT JOIN identity_directory d ON d.id=tm.sender_person_id
+                WHERE tm.sender_person_id IS NOT NULL AND tm.conversation_id IS NOT NULL
+                ORDER BY tm.sent_at DESC NULLS LAST
+                LIMIT 3
+            """).fetchall()
+            senders = [
+                {
+                    'person_id': row[0],
+                    'display_name': row[1],
+                    'conversation_id': row[2],
+                    'channel_id': row[3],
+                }
+                for row in fallback
+            ]
+        if not senders:
+            return {'ok': False, 'reason': 'teams_sender_context_missing', 'inserted': 0}
+
+        work = conn.execute("""
+            SELECT wo.id, wo.asset_id, wo.scheduled_start, wo.data, a.data, ast.data
+            FROM work_orders wo
+            LEFT JOIN accounts a ON a.id=wo.account_id
+            LEFT JOIN assets ast ON ast.id=wo.asset_id
+            WHERE wo.assigned_engineer_id=%s
+              AND wo.scheduled_start::date BETWEEN DATE '2026-09-16' AND DATE '2026-09-30'
+            ORDER BY wo.scheduled_start
+        """, (maya,)).fetchall()
+
+        templates = {
+            'nikhil': [
+                "Morning Maya — I saw the {account} job on your schedule. Ping me after diagnostics if you want a second set of eyes.",
+                "I can cover anything that moves while you're at {account}. Send me the first diagnostic readout when you have it.",
+                "Quick check-in on {account}: if the visit runs long, I can pick up the next remote call.",
+            ],
+            'hannah': [
+                "Parts update for {account}: common service stock is available regionally. I can reserve what you need after inspection.",
+                "For the {asset} at {account}, let me know the diagnostic result before I move any parts into reserved status.",
+                "I checked parts availability for today's route. Nothing is blocked right now; message me if {account} needs an expedited kit.",
+            ],
+            'david': [
+                "Quick heads-up on {account}: I saw a similar {asset} symptom recently. Check the baseline diagnostics before replacing parts.",
+                "For {account}, compare the current readings with the last service baseline before you close the diagnosis.",
+                "I reviewed the {account} context. If the first checks are clean, look at the recent service history before escalating.",
+            ],
+        }
+
+        for index, row in enumerate(work):
+            work_order_id, asset_id, scheduled_start, wo_data, account_data, asset_data = row
+            if not scheduled_start:
+                continue
+            account = (
+                (account_data or {}).get('name')
+                or (account_data or {}).get('account_name')
+                or (wo_data or {}).get('account_name')
+                or 'the customer'
+            )
+            asset = (
+                (asset_data or {}).get('product_name')
+                or (asset_data or {}).get('name')
+                or (wo_data or {}).get('product_name')
+                or 'instrument'
+            )
+
+            # Two contextual messages per Maya workday: one before the first visit,
+            # another later in the day. Sender/context are reused from authored DMs.
+            for slot in range(2):
+                sender = senders[(index * 2 + slot) % len(senders)]
+                sender_key = str(sender['display_name']).split()[0].lower()
+                choices = templates.get(sender_key, templates['nikhil'])
+                body_text = choices[(index + slot) % len(choices)].format(
+                    account=account, asset=asset
+                )
+                sent_at = scheduled_start - timedelta(minutes=45) if slot == 0 else scheduled_start + timedelta(hours=3, minutes=20)
+                message_id = f"syn_teams_{sent_at:%Y%m%d}_{index:02d}_{slot}_{sender['person_id']}"
+                payload = {
+                    'message_id': message_id,
+                    'conversation_id': sender['conversation_id'],
+                    'channel_id': sender['channel_id'],
+                    'sender_person_id': sender['person_id'],
+                    'sender_name': sender['display_name'],
+                    'sent_at': sent_at.isoformat(),
+                    'is_read': bool(slot == 0),
+                    'status': 'sent',
+                    'linked_work_order_id': work_order_id,
+                    'linked_asset_id': asset_id,
+                    'body_text': body_text,
+                    'synthetic_extension': 'september_2026_v1',
+                }
+                result = conn.execute("""
+                    INSERT INTO teams_messages(
+                        id, conversation_id, channel_id, sender_person_id, sent_at,
+                        is_read, status, work_order_id, asset_id, body_text, data
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(id) DO NOTHING
+                    RETURNING id
+                """, (
+                    message_id, sender['conversation_id'], sender['channel_id'],
+                    sender['person_id'], sent_at, bool(slot == 0), 'sent',
+                    work_order_id, asset_id, body_text, Jsonb(payload),
+                )).fetchone()
+                if result:
+                    inserted += 1
+
+        status = {
+            'ok': True,
+            'extension': 'september_2026_v1',
+            'inserted_this_run': inserted,
+            'target_start': '2026-09-16',
+            'target_end': '2026-09-30',
+        }
+        meta(conn, 'monthly_extension_status', status)
+        conn.commit()
+        return status
+
+
 def ensure_seeded(database_url: str):
+    seed_status = None
     with psycopg.connect(database_url, sslmode='require') as conn:
         exists = conn.execute("SELECT to_regclass('public.demo_meta')").fetchone()[0]
         if exists:
             row = conn.execute("SELECT value FROM demo_meta WHERE key='seed_status'").fetchone()
             if row and row[0].get('ok'):
-                return row[0]
-    return seed_database(database_url)
+                seed_status = row[0]
+
+    if seed_status is None:
+        seed_status = seed_database(database_url)
+
+    extension = ensure_monthly_teams_extension(database_url)
+    return {**seed_status, 'monthly_extension': extension}
