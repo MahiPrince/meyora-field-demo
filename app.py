@@ -475,15 +475,18 @@ def adapter_tool(request: AdapterToolRequest, authorization: str | None = Header
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
 
 
-@app.get("/adapter/coverage")
-def adapter_coverage(authorization: str | None = Header(default=None)):
-    _require_adapter_token(authorization)
+def _coverage_summary():
     with _conn() as conn:
         def span(table: str, column: str):
             row = conn.execute(
                 f"SELECT min({column})::text, max({column})::text, count(*) FROM {table}"
             ).fetchone()
             return {"min": row[0], "max": row[1], "count": row[2]}
+
+        dataset = conn.execute(
+            "SELECT value FROM demo_meta WHERE key='dataset'"
+        ).fetchone()
+        maya = (dataset[0] or {}).get("logged_in_user_id") if dataset else None
 
         daily = [
             {"date": r[0].isoformat(), "work_orders": r[1]}
@@ -494,13 +497,39 @@ def adapter_coverage(authorization: str | None = Header(default=None)):
                 GROUP BY 1 ORDER BY 1
             """).fetchall()
         ]
+        maya_daily = []
+        if maya:
+            maya_daily = [
+                {"date": r[0].isoformat(), "work_orders": r[1]}
+                for r in conn.execute("""
+                    SELECT scheduled_start::date, count(*)
+                    FROM work_orders
+                    WHERE assigned_engineer_id=%s AND scheduled_start IS NOT NULL
+                    GROUP BY 1 ORDER BY 1
+                """, (maya,)).fetchall()
+            ]
+
         return {
             "work_orders": span("work_orders", "scheduled_start"),
             "calendar_events": span("calendar_events", "start_at"),
             "emails": span("emails", "COALESCE(received_at,sent_at)"),
             "teams_messages": span("teams_messages", "sent_at"),
+            "service_notes": span("service_notes", "created_at"),
             "daily_work_orders": daily,
+            "maya_daily_work_orders": maya_daily,
         }
+
+
+@app.get("/coverage")
+def public_coverage():
+    """Aggregate-only synthetic demo coverage; exposes no record content."""
+    return _coverage_summary()
+
+
+@app.get("/adapter/coverage")
+def adapter_coverage(authorization: str | None = Header(default=None)):
+    _require_adapter_token(authorization)
+    return _coverage_summary()
 
 
 @app.post("/chat")
