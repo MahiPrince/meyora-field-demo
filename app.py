@@ -293,6 +293,11 @@ def startup():
             connectors = connectors_row[0] if connectors_row else {}
             print("MEYORA_CONNECTORS " + json.dumps(connectors, sort_keys=True, default=str), flush=True)
 
+        try:
+            print("MEYORA_COVERAGE " + json.dumps(_coverage_summary(), sort_keys=True, default=str), flush=True)
+        except Exception as coverage_error:
+            print("MEYORA_COVERAGE_ERROR " + f"{type(coverage_error).__name__}: {coverage_error}", flush=True)
+
         if os.getenv("MEYORA_CHAT_SELFTEST") == "1":
             threading.Thread(target=_run_chat_selftest, daemon=True, name="meyora-chat-selftest").start()
     except Exception as e:
